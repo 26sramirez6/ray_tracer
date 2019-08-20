@@ -19,6 +19,8 @@
 #include <cstdlib>
 #include <omp.h>
 #include <cuda.h>
+#include <curand.h>
+#include <curand_kernel.h>
 
 using std::cout;
 using std::endl;
@@ -35,49 +37,126 @@ using cllu_t = const unsigned long long;
 constexpr double pi = 3.141592653589793238462643383279502884;
 constexpr int nThreadsPerBlock = 256;
 constexpr int nBlocks = 128;
+constexpr int N = 100;
+constexpr int R = 6;
+constexpr int Wmax = 10;
+
 
 __global__ void 
-dot( int *a, int *b, int *c ) {
-	__shared__ int temp[nThreadsPerBlock];
-	int index = threadIdx.x + blockIdx.x*blockDim.x;
-	temp[threadIdx.x] = a[index] * b[index];
-	__syncthreads();
-	if( 0 == threadIdx.x ) {
-		int sum = 0;
-		for( int i = 0; i < nThreadsPerBlock; i++ )
-			sum += temp[i];
-		atomicAdd(c,sum);
+setup_kernel(curandState * state, cllu_t seed) {
+    int id = threadIdx.x + blockIdx.x * blockDim.x;
+    curand_init(seed, id, 0, &state[id]);
+}
+
+__device__ double
+random_double( curandState * state, double min, double max ) {
+	int id = threadIdx.x + blockIdx.x * blockDim.x;
+	curandState localState = state[id];
+	double ret = min + curand_uniform(state+id)*(max - min);
+	state[id] = localState;
+	return ret;
+}
+
+struct Config {
+	cllu_t N_;
+	cllu_t G_;
+	cllu_t G2_;
+	cd_t GD2_;
+
+	Config(char ** argv) : N_(stoll(argv[1])),
+			G_(stoll(argv[2])), G2_(G_*G_), GD2_(G_/2.) {
 	}
-}
+};
 
-__global__ double
-random_double( double min,  double max ) {
-	return min + (double)rand()/(double)RAND_MAX * (max - min);
-}
+struct Vec3d {
+	double x_ = 0;
+	double y_ = 0;
+	double z_ = 0;
 
-__global__ double
-norm(int x, int y, int z) {
-	return sqrt(x_*x_+y_*y_+z_*z_);
-}
+	__device__
+	Vec3d() {}
+	
+	__device__
+	Vec3d(double x, double y, double z) : x_(x), y_(y), z_(z) {}
 
-__global__ double
-direction_sampling() {
-	cd_t phi = random_double(0, 2*pi);
-	cd_t cosTheta = random_double(-1, 1);
-	cd_t sinTheta = sqrt(1-(cosTheta*cosTheta));
-	x_ = sinTheta*cos(phi);
-	y_ = sinTheta*sin(phi);
-	z_ = cosTheta;
-}
+	__device__ double
+	norm() const {
+		return sqrt(x_*x_+y_*y_+z_*z_);
+	}
 
-void
-ray_serial(Config & cfg) {
-	double * G = (double *)calloc(cfg.G2_, sizeof(double));
+	__device__ double
+	dot(Vec3d other) {
+		return other.x_*x_ + other.y_*y_ + other.z_*z_;
+	}
+
+	__device__ void
+	Set(double x, double y, double z) {
+		x_ = x;
+		y_ = y;
+		z_ = z;
+	}
+
+	__device__ void
+	Set(Vec3d & other) {
+		x_ = other.x_;
+		y_ = other.y_;
+		z_ = other.z_;
+	}
+
+	__device__ void
+	direction_sampling(curandState * state) {
+		cd_t phi = random_double(state, 0, 2*pi);
+		cd_t cosTheta = random_double(state, -1, 1);
+		cd_t sinTheta = sqrt(1-(cosTheta*cosTheta));
+		x_ = sinTheta*cos(phi);
+		y_ = sinTheta*sin(phi);
+		z_ = cosTheta;
+	}
+
+};
+
+
+
+//__device__ double 
+//dot(double * a, double * b, cllu_t N) {
+//	double ret = 0;
+//	for (llu_t i=0; i<N; i++) {
+//		ret += a[i]*b[i];
+//	}
+//	return ret;
+//}
+//
+//__device__ double 
+//copy_vec3d(double * a, double * b) {
+//	a[0] = b[0];
+//	a[1] = b[1];
+//	a[2] = b[2];
+//}
+
+
+//
+//__device__ double
+//norm(double x, double y, double z) {
+//	return sqrt(x*x+y*y+z*z);
+//}
+
+//__device__ void
+//direction_sampling( curandState * state, double * vec ) {
+//	cd_t phi = random_double(state, 0, 2*pi);
+//	cd_t cosTheta = random_double(state, -1, 1);
+//	cd_t sinTheta = sqrt(1-(cosTheta*cosTheta));
+//	vec[0] = sinTheta*cos(phi);
+//	vec[1] = sinTheta*sin(phi);
+//	vec[2] = cosTheta
+//	return;
+//}
+
+__global__ void
+ray_cuda(double * G, cllu_t G, cllu_t G2) {
 	Vec3d W(0,10,0), V, C(0,12,0), N, S, I, L(4,4,-1), IC, LI;
-	constexpr int R = 6;
-	constexpr int Wmax = 10;
+	
 	cd_t ref = cfg.GD2_/Wmax;
-	double t0 = omp_get_wtime();
+	
 	for (llu_t i=0; i<cfg.N_; i++) {
 		do {
 			V.direction_sampling();
@@ -104,12 +183,7 @@ ray_serial(Config & cfg) {
 		cll_t y = (cll_t)floor(W.z_*ref + cfg.GD2_);
 		G[x*cfg.G_ + y] += b;
 	}
-	double t1 = omp_get_wtime();
-	cout << "Total Runtime (seconds): " << t1-t0 << endl;
-
-	FILE * f = fopen("hw4.out", "wb");
-	fwrite(G, sizeof(double), cfg.G2_, f);
-	fclose(f);
+	
 }
 
 int
@@ -117,7 +191,52 @@ main(int argc, char ** argv) {
 	if (argc!=3) {
 		cout << "Usage ./ray_tracing <number of rays> <gridpoints>" << endl;
 	}
-	srand((unsigned int)time(NULL));
-	Config cfg(argv);
-	ray_serial(cfg);
+	
+	double * a;
+	double * dev_a;
+    
+    curandState * d_states;
+    cudaMalloc(&d_states, sizeof(curandState)*N);
+      
+    a = (double *)malloc( N*sizeof(double) );
+//    b = (int*)malloc( size );
+//    c = (int*)malloc( sizeof(int) );
+
+//    for (i=0;i<N;++i){
+//        a[i] = 1;
+//        b[i] = i;
+//    }
+//	*c = 0;
+    cudaMalloc( (void**)&dev_a, N*sizeof( double ) );
+    double t0 = omp_get_wtime();
+//    cudaMalloc( (void**)&dev_b, size );
+//    cudaMalloc( (void**)&dev_c, sizeof(int) );
+
+//    cudaMemcpy( dev_a, a, size, cudaMemcpyHostToDevice );
+//    cudaMemcpy( dev_b, b, size, cudaMemcpyHostToDevice );
+//    cudaMemcpy( dev_c, c, sizeof(int), cudaMemcpyHostToDevice );
+    
+    // launch add() kernel on GPU, passing parameters
+//    dot<<< N/nThreadsPerBlock, nThreadsPerBlock >>>( dev_a, dev_b, dev_c );
+	cllu_t threadsLaunch = N < nThreadsPerBlock ? N : nThreadsPerBlock;
+    setup_kernel<<<N/nThreadsPerBlock, threadsLaunch>>>( d_states, time(NULL) );
+    random_double<<<N/nThreadsPerBlock + 1, threadsLaunch>>>( d_states, dev_a, 10, 15 );
+    // copy device result back to host copy of c
+//    cudaMemcpy( c, dev_c, sizeof(int), cudaMemcpyDeviceToHost );
+    cudaMemcpy( a, dev_a, sizeof(double)*N, cudaMemcpyDeviceToHost);
+    
+    double t1 = omp_get_wtime();
+	cout << "Total Runtime (seconds): " << t1-t0 << endl;
+
+	FILE * f = fopen("hw4.out", "wb");
+	fwrite(G, sizeof(double), cfg.G2_, f);
+	fclose(f);
+
+	cudaFree( dev_a );
+    free(a);
+//    cudaFree( dev_b );
+//    cudaFree( dev_c );
+//    printf("c:%d\n", *c);
+    
+    return 0;
 }
